@@ -1,0 +1,8 @@
+{
+  "name": "atelierkpi-site",
+  "private": true,
+  "description": "Site AtelierKPi (Netlify) : la fonction d'avis de demande utilise nodemailer.",
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  }
+}
