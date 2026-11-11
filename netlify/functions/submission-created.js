@@ -31,15 +31,26 @@ function nomFichier(v) {
   try { return decodeURIComponent(String(v).split("/").pop()); } catch { return "(fichier)"; }
 }
 
+function urlFichier(v) {
+  if (!v) return null;
+  if (typeof v === "object") return v.url || null;
+  return /^https:\/\//i.test(String(v)) ? String(v) : null;
+}
+
 function construireAvis(payload) {
   const data = payload.data || {};
   const formulaire = payload.form_name || data["form-name"] || "demande";
   const lignes = [`Nouvelle ${formulaire === "commande" ? "commande" : "demande"} reçue sur atelierkpi.ca`, ""];
   const fichiers = [];
+  const aJoindre = [];
 
   for (const [cle, valeur] of Object.entries(data)) {
     if (IGNORES.has(cle) || valeur === "" || valeur == null) continue;
-    if (/^fichier\d*$/i.test(cle)) { const n = nomFichier(valeur); if (n) fichiers.push(n); continue; }
+    if (/^fichier\d*$/i.test(cle)) {
+      const n = nomFichier(valeur);
+      if (n) { fichiers.push(n); const u = urlFichier(valeur); if (u) aJoindre.push({ filename: n, url: u }); }
+      continue;
+    }
     const libelle = LIBELLES[cle] || cle;
     const texte = sansLiens(typeof valeur === "object" ? JSON.stringify(valeur) : valeur);
     lignes.push(texte.includes("\n") || texte.length > 70 ? `${libelle} :\n${texte}\n` : `${libelle} : ${texte}`);
@@ -47,12 +58,35 @@ function construireAvis(payload) {
 
   lignes.push("");
   lignes.push(fichiers.length
-    ? `Fichiers joints (${fichiers.length}) : ${fichiers.map(sansLiens).join(", ")}\nLes fichiers sont à voir dans Netlify, section Forms.`
+    ? `Fichiers joints (${fichiers.length}) : ${fichiers.map(sansLiens).join(", ")}`
     : "Aucun fichier joint.");
 
   const sujet = sansLiens(data.subject || `${formulaire === "commande" ? "Commande" : "Demande"} AtelierKPi — ${data.nom || "client"}`);
-  return { sujet, texte: lignes.join("\n"), repondreA: data.email };
+  return { sujet, texte: lignes.join("\n"), repondreA: data.email, aJoindre };
 }
+
+// Télécharge les fichiers du client pour les mettre en VRAIES pièces jointes (aucun lien dans le courriel).
+// Limite totale de 20 Mo (Gmail accepte 25 Mo par message).
+const MAX_TOTAL = 20 * 1024 * 1024;
+async function telechargerPiecesJointes(liste) {
+  const pieces = [];
+  const ratees = [];
+  let total = 0;
+  for (const f of liste) {
+    try {
+      const r = await fetch(f.url, { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const contenu = Buffer.from(await r.arrayBuffer());
+      if (total + contenu.length > MAX_TOTAL) { ratees.push(`${f.filename} (trop gros)`); continue; }
+      total += contenu.length;
+      pieces.push({ filename: f.filename, content: contenu, contentType: r.headers.get("content-type") || undefined });
+    } catch (err) {
+      ratees.push(`${f.filename} (${err.message})`);
+    }
+  }
+  return { pieces, ratees };
+}
+exports.telechargerPiecesJointes = telechargerPiecesJointes;
 
 exports.construireAvis = construireAvis;
 
@@ -71,18 +105,30 @@ exports.handler = async (event) => {
     auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD.replace(/\s+/g, "") },
   });
 
+  const { pieces, ratees } = await telechargerPiecesJointes(avis.aJoindre);
+  let texte = avis.texte;
+  if (ratees.length) texte += `\nNon joints (à voir dans Netlify, section Forms) : ${ratees.join(", ")}`;
+
+  const message = {
+    from: `"Site AtelierKPi" <${GMAIL_USER}>`,
+    to: NOTIF_TO,
+    replyTo: avis.repondreA || undefined,
+    subject: avis.sujet,
+  };
+
   try {
-    await transport.sendMail({
-      from: `"Site AtelierKPi" <${GMAIL_USER}>`,
-      to: NOTIF_TO,
-      replyTo: avis.repondreA || undefined,
-      subject: avis.sujet,
-      text: avis.texte,
-    });
-    console.log("Avis envoyé :", avis.sujet);
+    await transport.sendMail({ ...message, text: texte, attachments: pieces });
+    console.log(`Avis envoyé avec ${pieces.length} pièce(s) jointe(s) :`, avis.sujet);
   } catch (err) {
-    // On ne fait jamais échouer la demande du client : on note l'erreur dans les journaux de la fonction.
-    console.error("Échec de l'envoi de l'avis :", err.message);
+    // Gmail peut refuser une pièce jointe (type interdit, taille) : on renvoie l'avis sans les fichiers.
+    console.error("Échec avec pièces jointes :", err.message);
+    try {
+      await transport.sendMail({ ...message, text: texte + "\n\nLes fichiers n'ont pas pu être joints : voir Netlify, section Forms." });
+      console.log("Avis envoyé sans pièces jointes :", avis.sujet);
+    } catch (err2) {
+      // On ne fait jamais échouer la demande du client : l'erreur reste dans les journaux de la fonction.
+      console.error("Échec de l'envoi de l'avis :", err2.message);
+    }
   }
   return { statusCode: 200, body: "ok" };
 };
